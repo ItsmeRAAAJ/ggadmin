@@ -1,6 +1,7 @@
 {
   "name": "my-ggits",
   "private": true,
+  "packageManager": "npm@11.19.0",
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
