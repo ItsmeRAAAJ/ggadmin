@@ -1,0 +1,50 @@
+# Local development stack: Postgres + Backend API.
+# Run from the monorepo root:  docker compose up --build
+# The admin panel and mobile app run on the host (see docs/RUNBOOK.md).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mygg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-root}
+      POSTGRES_DB: ${POSTGRES_DB:-myggits-dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mygg} -d ${POSTGRES_DB:-myggits-dev}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Optional: AWS / Brevo keys etc. from apps/backend/.env (the values below take precedence)
+    env_file:
+      - path: ./apps/backend/.env
+        required: false
+    environment:
+      # Talk to Postgres over the compose network, not localhost
+      DATABASE_URL: postgresql://${POSTGRES_USER:-mygg}:${POSTGRES_PASSWORD:-root}@postgres:5432/${POSTGRES_DB:-myggits-dev}
+      NODE_ENV: development
+      PORT: 3001
+      JWT_SECRET: ${JWT_SECRET:-local_dev_only_jwt_secret_change_me_0123456789}
+      OTP_PEPPER: ${OTP_PEPPER:-local_dev_only_otp_pepper_change_me_0123456789}
+      APP_NAME: "My GGITS (Development)"
+      TRUST_PROXY_HOPS: 0
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Migrate, run the idempotent seed (branches, roles, permissions, super admin), start.
+    command: sh -c "npx prisma migrate deploy && node dist/prisma/seed.js && node dist/src/index.js"
+
+volumes:
+  postgres_local_data:

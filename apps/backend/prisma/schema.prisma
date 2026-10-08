@@ -1,0 +1,466 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ENUMS
+
+enum Role {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+enum AccountStatus {
+  PENDING_ACTIVATION // pre-seeded, student hasn't logged in yet
+  ACTIVE
+  DISABLED
+}
+
+enum OtpPurpose {
+  FIRST_LOGIN
+  PASSWORD_RESET
+}
+
+enum PermissionCategory {
+  ADMIN_MANAGEMENT
+  STUDENT_DATA_FIELD
+  TEACHER_CAPABILITY
+  ASSESSMENT_AND_MARKS
+}
+
+enum TeacherTier {
+  HOD
+  INCHARGE
+  SUBJECT_TEACHER
+}
+
+enum AchievementCategory {
+  ACADEMIC
+  CO_CURRICULAR
+  EXTRA_CURRICULAR
+}
+
+enum AssignmentStatus {
+  DRAFT
+  PUBLISHED
+  CLOSED
+}
+
+enum SubmissionStatus {
+  PENDING
+  SUBMITTED
+  LATE
+  GRADED
+}
+
+enum PeerResourceCategory {
+  PREVIOUS_YEAR_PAPER
+  LAB_MANUAL
+  REFERENCE_MATERIAL
+  USEFUL_LINK
+  CHEATSHEET
+  OTHER
+}
+
+enum PeerResourceScope {
+  CLASS // uploader's exact branch + semester + section
+  BRANCH // uploader's branch, any semester/section
+  SEMESTER // uploader's semester, any branch/section
+}
+
+// CORE IDENTITY: pre-seeded by admin, then activated by the student
+
+model User {
+  id               String        @id @default(cuid())
+  enrollmentNumber String?       @unique // null for teacher/admin accounts
+  email            String        @unique
+  passwordHash     String? // set during onboarding, null until activated
+  role             Role
+  status           AccountStatus @default(PENDING_ACTIVATION)
+  tokenVersion     Int           @default(0) // bumped on password reset / forced logout — invalidates old JWTs
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  studentProfile   StudentProfile?
+  teacherProfile   TeacherProfile?
+  adminProfile     AdminProfile?
+  otpVerifications OtpVerification[]
+  auditLogs        AuditLog[]        @relation("ActorAuditLogs")
+
+  adminPermissionsGranted   AdminPermissionGrant[]   @relation("AdminPermissionGranter")
+  teacherPermissionsGranted TeacherPermissionGrant[] @relation("TeacherPermissionGranter")
+
+  @@index([email])
+  @@index([enrollmentNumber])
+}
+
+model OtpVerification {
+  id         String     @id @default(cuid())
+  userId     String
+  user       User       @relation(fields: [userId], references: [id])
+  codeHash   String // never store OTP in plaintext
+  purpose    OtpPurpose
+  expiresAt  DateTime
+  consumedAt DateTime?
+  attempts   Int        @default(0) // failed verification attempts; OTP is burned after the limit
+  createdAt  DateTime   @default(now())
+
+  @@index([userId, purpose, createdAt])
+}
+
+// STUDENT PROFILE / PORTFOLIO
+
+model Branch {
+  id        String @id @default(cuid())
+  shortCode String @unique // e.g. "CSEAIML", "CSEIOT", "CSE"... etc..
+  name      String // e.g. "Computer Science - AIML... etc."
+
+  subjects           Subject[]
+  studentProfiles    StudentProfile[]
+  overseeingTeachers TeacherProfile[]
+}
+
+model StudentProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id])
+
+  firstName   String?
+  lastName    String?
+  phone       String?
+  dateOfBirth DateTime?
+
+  branchId        String
+  branch          Branch  @relation(fields: [branchId], references: [id])
+  admissionYear   Int // e.g. 2024
+  passoutYear     Int // eg. 2028
+  currentSemester Int     @default(1) // 1–8
+  section         String?
+
+  profileImageUrl  String? // S3 URL
+  techResumeUrl    String?
+  nonTechResumeUrl String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  certificates          Certificate[]
+  projects              Project[]
+  achievements          Achievement[]
+  socialLinks           SocialLink[]
+  assignmentSubmissions AssignmentSubmission[]
+  peerResourcesUploaded PeerResource[]
+
+  @@index([branchId, admissionYear, currentSemester])
+}
+
+model Certificate {
+  id               String         @id @default(cuid())
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id])
+  title            String
+  issuer           String?
+  issueDate        DateTime?
+  fileUrl          String // S3 URL
+  createdAt        DateTime       @default(now())
+}
+
+model Project {
+  id               String         @id @default(cuid())
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id])
+  title            String
+  description      String?
+  techStack        String[] // Postgres native array
+  link             String?
+  startDate        DateTime?
+  endDate          DateTime?
+  createdAt        DateTime       @default(now())
+}
+
+model Achievement {
+  id               String              @id @default(cuid())
+  studentProfileId String
+  studentProfile   StudentProfile      @relation(fields: [studentProfileId], references: [id])
+  title            String
+  description      String?
+  date             DateTime?
+  fileUrl          String? // optional supporting doc, S3 URL
+  category         AchievementCategory @default(ACADEMIC)
+  createdAt        DateTime            @default(now())
+}
+
+model SocialLink {
+  id               String         @id @default(cuid())
+  studentProfileId String
+  studentProfile   StudentProfile @relation(fields: [studentProfileId], references: [id])
+  platform         String // "LINKEDIN" | "GITHUB" | "PORTFOLIO" | "OTHER"
+  url              String
+}
+
+// TEACHERS & SUBJECTS
+
+model TeacherProfile {
+  id         String  @id @default(cuid())
+  userId     String  @unique
+  user       User    @relation(fields: [userId], references: [id])
+  name       String
+  department String?
+
+  tier            TeacherTier      @default(SUBJECT_TEACHER)
+  reportsToId     String?
+  reportsTo       TeacherProfile?  @relation("TeacherHierarchy", fields: [reportsToId], references: [id])
+  manages         TeacherProfile[] @relation("TeacherHierarchy")
+  primaryBranchId String? // branch an HOD/Incharge oversees; nullable for plain subject teachers
+  primaryBranch   Branch?          @relation(fields: [primaryBranchId], references: [id])
+
+  assignments            TeacherSubjectAssignment[]
+  permissionGrants       TeacherPermissionGrant[]
+  assignmentsOwned       Assignment[]
+  deadlinesCreated       AcademicDeadline[]
+  resourceFoldersCreated ResourceFolder[]
+  resourceFilesUploaded  ResourceFile[]
+}
+
+model Subject {
+  id       String @id @default(cuid())
+  name     String
+  code     String @unique
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id])
+  semester Int // 1–8
+
+  assignments       TeacherSubjectAssignment[]
+  assignmentsModule Assignment[]
+  deadlines         AcademicDeadline[]
+  resourceFolders   ResourceFolder[]
+  peerResources     PeerResource[]
+
+  @@index([branchId, semester])
+}
+
+model TeacherSubjectAssignment {
+  id               String         @id @default(cuid())
+  teacherProfileId String
+  teacherProfile   TeacherProfile @relation(fields: [teacherProfileId], references: [id])
+  subjectId        String
+  subject          Subject        @relation(fields: [subjectId], references: [id])
+  section          String?
+  academicYear     Int
+
+  @@unique([teacherProfileId, subjectId, section, academicYear])
+}
+
+// Admin: role-based, extensible without migrations
+
+model AdminRole {
+  id        String   @id @default(cuid())
+  key       String   @unique // stable machine key, e.g. "SUPERADMIN", "TPO"
+  label     String // display name, editable anytime — "Training & Placement Officer"
+  createdAt DateTime @default(now())
+
+  assignments AdminRoleAssignment[]
+}
+
+model AdminProfile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  name      String?
+  createdAt DateTime @default(now())
+
+  parentAdminId String?
+  parentAdmin   AdminProfile?  @relation("AdminHierarchy", fields: [parentAdminId], references: [id])
+  managedAdmins AdminProfile[] @relation("AdminHierarchy")
+
+  roleAssignments          AdminRoleAssignment[]
+  permissionGrantsReceived AdminPermissionGrant[] @relation("PermissionGrantsReceived")
+}
+
+model AdminRoleAssignment {
+  id             String       @id @default(cuid())
+  adminProfileId String
+  adminProfile   AdminProfile @relation(fields: [adminProfileId], references: [id])
+  adminRoleId    String
+  adminRole      AdminRole    @relation(fields: [adminRoleId], references: [id])
+  assignedAt     DateTime     @default(now())
+
+  @@unique([adminProfileId, adminRoleId])
+}
+
+model Permission {
+  id          String             @id @default(cuid())
+  key         String             @unique // e.g. "VIEW_STUDENT_MARKS" — stable, never renamed once used in code
+  label       String // human-readable, editable anytime
+  description String?
+  category    PermissionCategory
+  createdAt   DateTime           @default(now())
+
+  adminGrants   AdminPermissionGrant[]
+  teacherGrants TeacherPermissionGrant[]
+}
+
+model AdminPermissionGrant {
+  id              String       @id @default(cuid())
+  adminProfileId  String
+  adminProfile    AdminProfile @relation("PermissionGrantsReceived", fields: [adminProfileId], references: [id])
+  permissionId    String
+  permission      Permission   @relation(fields: [permissionId], references: [id])
+  grantedByUserId String // User.id of the granting admin — must be an ancestor, checked in service layer
+  grantedBy       User         @relation("AdminPermissionGranter", fields: [grantedByUserId], references: [id])
+  grantedAt       DateTime     @default(now())
+
+  @@unique([adminProfileId, permissionId])
+}
+
+model TeacherPermissionGrant {
+  id               String         @id @default(cuid())
+  teacherProfileId String
+  teacherProfile   TeacherProfile @relation(fields: [teacherProfileId], references: [id])
+  permissionId     String
+  permission       Permission     @relation(fields: [permissionId], references: [id])
+  grantedByUserId  String // User.id of the granting admin/HOD/Incharge
+  grantedBy        User           @relation("TeacherPermissionGranter", fields: [grantedByUserId], references: [id])
+  grantedAt        DateTime       @default(now())
+
+  @@unique([teacherProfileId, permissionId])
+}
+
+// ─────────────────────────────────────────────
+// ASSIGNMENTS
+// ─────────────────────────────────────────────
+
+model Assignment {
+  id          String           @id @default(cuid())
+  subjectId   String
+  subject     Subject          @relation(fields: [subjectId], references: [id])
+  createdById String
+  createdBy   TeacherProfile   @relation(fields: [createdById], references: [id])
+  title       String
+  description String?
+  dueAt       DateTime
+  maxMarks    Int?
+  status      AssignmentStatus @default(DRAFT)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  submissions AssignmentSubmission[]
+
+  @@index([subjectId, status])
+}
+
+model AssignmentSubmission {
+  id               String           @id @default(cuid())
+  assignmentId     String
+  assignment       Assignment       @relation(fields: [assignmentId], references: [id])
+  studentProfileId String
+  studentProfile   StudentProfile   @relation(fields: [studentProfileId], references: [id])
+  fileUrl          String?
+  submittedAt      DateTime?
+  status           SubmissionStatus @default(PENDING)
+  marksAwarded     Int?
+  feedback         String?
+
+  @@unique([assignmentId, studentProfileId])
+}
+
+// ─────────────────────────────────────────────
+// ACADEMICS: deadlines, subject resources, peer sharing
+// ─────────────────────────────────────────────
+
+// Teacher-posted reminder. Purely informational — no per-student submission tracking.
+model AcademicDeadline {
+  id          String         @id @default(cuid())
+  subjectId   String
+  subject     Subject        @relation(fields: [subjectId], references: [id])
+  createdById String
+  createdBy   TeacherProfile @relation(fields: [createdById], references: [id])
+  title       String
+  description String?
+  dueAt       DateTime
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([subjectId, dueAt])
+}
+
+// Teacher-curated subject material: Subject → Folder → File (one level, no nesting).
+model ResourceFolder {
+  id          String         @id @default(cuid())
+  subjectId   String
+  subject     Subject        @relation(fields: [subjectId], references: [id])
+  name        String
+  order       Int            @default(0)
+  createdById String
+  createdBy   TeacherProfile @relation(fields: [createdById], references: [id])
+  createdAt   DateTime       @default(now())
+
+  files ResourceFile[]
+
+  @@unique([subjectId, name])
+}
+
+model ResourceFile {
+  id           String         @id @default(cuid())
+  folderId     String
+  folder       ResourceFolder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  title        String
+  fileUrl      String // S3 URL
+  fileName     String? // original name, for display/download
+  fileSize     Int? // bytes, from S3 at upload confirmation
+  uploadedById String
+  uploadedBy   TeacherProfile @relation(fields: [uploadedById], references: [id])
+  createdAt    DateTime       @default(now())
+
+  @@index([folderId, createdAt])
+}
+
+// Student-shared material. Exactly one of fileUrl / linkUrl is set (enforced in the service layer).
+// Scope fields are resolved from the uploader's profile at upload time.
+model PeerResource {
+  id            String               @id @default(cuid())
+  uploadedById  String
+  uploadedBy    StudentProfile       @relation(fields: [uploadedById], references: [id])
+  title         String
+  description   String?
+  category      PeerResourceCategory @default(OTHER)
+  subjectId     String?
+  subject       Subject?             @relation(fields: [subjectId], references: [id])
+  fileUrl       String?
+  fileName      String?
+  fileSize      Int?
+  linkUrl       String?
+  scope         PeerResourceScope
+  scopeBranchId String
+  scopeSemester Int?
+  scopeSection  String?
+  createdAt     DateTime             @default(now())
+
+  @@index([scopeBranchId, scopeSemester, scopeSection])
+  @@index([category])
+  @@index([createdAt])
+  @@index([uploadedById])
+}
+
+// ─────────────────────────────────────────────
+// AUDIT LOG — data-sensitivity requirement, not optional
+// ─────────────────────────────────────────────
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorUserId  String
+  actor        User     @relation("ActorAuditLogs", fields: [actorUserId], references: [id])
+  action       String // e.g. "EXPORT_STUDENT_PROFILES", "SEED_STUDENTS"
+  targetEntity String?
+  targetId     String?
+  metadata     String?
+  createdAt    DateTime @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([createdAt])
+  @@index([action, createdAt])
+}
